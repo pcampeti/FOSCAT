@@ -413,12 +413,52 @@ class BkTorch(BackendBase.BackendBase):
         return S.numel()
     
     def bk_SparseTensor(self, indice, w, dense_shape=[]):
-        return self.backend.sparse_coo_tensor(indice, w, dense_shape).coalesce().to_sparse_csr().to(self.torch_device)
+        if dense_shape is None or len(dense_shape) != 2:
+            raise ValueError("dense_shape must be a tuple/list of length 2 for CSR tensors")
+
+        def _to_cpu_tensor(x):
+            if isinstance(x, torch.Tensor):
+                return x.detach().to(device="cpu")
+            if isinstance(x, np.ndarray):
+                return torch.from_numpy(x)
+            return torch.tensor(x)
+
+        indices = _to_cpu_tensor(indice)
+        if indices.dim() != 2:
+            raise ValueError("indice must be a 2D array of coordinates")
+
+        if indices.shape[0] == 2 and indices.shape[1] != 2:
+            indices = indices.t().contiguous()
+        elif indices.shape[1] != 2:
+            raise ValueError("indice must have shape [N, 2] or [2, N]")
+
+        indices = indices.to(dtype=torch.long, device="cpu")
+        values = _to_cpu_tensor(w)
+
+        if values.dtype.is_complex:
+            target_dtype = self.all_cbk_type
+        elif values.dtype in (torch.int32, torch.int64, torch.bool):
+            target_dtype = values.dtype
+        else:
+            target_dtype = self.all_bk_type
+
+        values = values.to(dtype=target_dtype, device="cpu")
+
+        coo = torch.sparse_coo_tensor(indices.t(), values, dense_shape, device="cpu")
+        coo = coo.coalesce()
+        return coo.to_sparse_csr()
 
     def bk_stack(self, list, axis=0):
         return self.backend.stack(list, axis=axis).to(self.torch_device)
 
     def bk_sparse_dense_matmul(self, smat, mat):
+        if not isinstance(mat, torch.Tensor):
+            raise TypeError("mat must be a torch.Tensor for torch backend")
+
+        target_device = mat.device
+        if smat.device != target_device:
+            smat = smat.to(target_device)
+
         return smat.matmul(mat)
 
     def conv2d(self, x, w):
@@ -799,47 +839,57 @@ class BkTorch(BackendBase.BackendBase):
         return self.backend.clamp(x, min=xmin, max=xmax)
 
     def bk_cast(self, x):
-        if isinstance(x, np.float64):
-            if self.all_bk_type == "float32":
-                return self.backend.tensor(np.float32(x)).to(self.torch_device)
-            else:
-                return self.backend.tensor(x).to(self.torch_device)
-        if isinstance(x, np.float32):
-            if self.all_bk_type == "float64":
-                return self.backend.tensor(np.float64(x)).to(self.torch_device)
-            else:
-                return self.backend.tensor(x).to(self.torch_device)
-        if isinstance(x, np.complex128):
-            if self.all_bk_type == "float32":
-                return self.backend.tensor(np.complex64(x)).to(self.torch_device)
-            else:
-                return self.backend.tensor(x).to(self.torch_device)
-        if isinstance(x, np.complex64):
-            if self.all_bk_type == "float64":
-                return self.backend.tensor(np.complex128(x)).to(self.torch_device)
-            else:
-                return self.backend.tensor(x).to(self.torch_device)
+        # ------------------------------------------------------------------
+        # Scalar numpy values ------------------------------------------------
+        if isinstance(x, (np.float64, np.float32)):
+            target = self.all_bk_type
+            return self.backend.tensor(x, dtype=target, device=self.torch_device)
 
-        if isinstance(x, np.int32) or isinstance(x, np.int64) or isinstance(x, int):
-            if self.all_bk_type == "float64":
-                return self.backend.tensor(np.float64(x)).to(self.torch_device)
-            else:
-                return self.backend.tensor(np.float32(x)).to(self.torch_device)
+        if isinstance(x, (np.complex128, np.complex64)):
+            target = self.all_cbk_type
+            return self.backend.tensor(x, dtype=target, device=self.torch_device)
 
-        if self.bk_is_complex(x):
-            out_type = self.all_cbk_type
-        else:
-            out_type = self.all_bk_type
+        if isinstance(x, (np.integer, int)):
+            return self.backend.tensor(x, dtype=self.backend.int64, device=self.torch_device)
 
+        # ------------------------------------------------------------------
+        # Array-like numpy values ------------------------------------------
         if isinstance(x, np.ndarray):
-            x = self.backend.from_numpy(x).to(self.torch_device)
+            if np.issubdtype(x.dtype, np.complexfloating):
+                target = self.all_cbk_type
+                cast_type = np.complex64 if target == self.backend.complex64 else np.complex128
+                tensor = self.backend.from_numpy(x.astype(cast_type, copy=False))
+            elif np.issubdtype(x.dtype, np.floating):
+                target = self.all_bk_type
+                cast_type = np.float32 if target == self.backend.float32 else np.float64
+                tensor = self.backend.from_numpy(x.astype(cast_type, copy=False))
+            elif np.issubdtype(x.dtype, np.integer):
+                tensor = self.backend.from_numpy(x.astype(np.int64, copy=False))
+                return tensor.to(self.torch_device)
+            else:
+                tensor = self.backend.from_numpy(x)
+            return tensor.to(self.torch_device)
 
-        if x.dtype.is_complex:
-            out_type = self.all_cbk_type
-        else:
-            out_type = self.all_bk_type
+        # ------------------------------------------------------------------
+        # Torch tensors -----------------------------------------------------
+        if isinstance(x, self.backend.Tensor):
+            if x.dtype.is_complex:
+                target = self.all_cbk_type
+            elif x.dtype in (self.backend.int32, self.backend.int64, self.backend.bool):
+                target = x.dtype
+            else:
+                target = self.all_bk_type
+            return x.to(device=self.torch_device, dtype=target)
 
-        return x.type(out_type).to(self.torch_device)
+        # ------------------------------------------------------------------
+        # Python native floats ---------------------------------------------
+        if isinstance(x, float):
+            target = self.all_bk_type
+            return self.backend.tensor(x, dtype=target, device=self.torch_device)
+
+        # ------------------------------------------------------------------
+        # Fallback ----------------------------------------------------------
+        return self.backend.tensor(x).to(self.torch_device)
 
     def bk_variable(self, x):
         return self.bk_cast(x)

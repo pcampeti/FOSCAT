@@ -852,9 +852,10 @@ class FoCUS:
                     indice[:, 0] = p
                     
                     self.pix_interp_val[(lout,nout)] = 1
+                    weight_dtype = np.dtype(self.backend.all_type)
                     self.weight_interp_val[(lout,nout)] = self.backend.bk_SparseTensor(
-                        self.backend.bk_constant(indice.T),
-                        self.backend.bk_constant(self.backend.bk_cast(w)),
+                        indice.astype(np.int64, copy=False),
+                        w.astype(weight_dtype, copy=False),
                         dense_shape=[i_npix,o_cell_ids.shape[0]],
                     )
 
@@ -904,9 +905,10 @@ class FoCUS:
                     indice[:, 0] = p
                     
                     self.pix_interp_val[(lout,nout)] = 1
+                    weight_dtype = np.dtype(self.backend.all_type)
                     self.weight_interp_val[(lout,nout)] = self.backend.bk_SparseTensor(
-                        self.backend.bk_constant(indice.T),
-                        self.backend.bk_constant(self.backend.bk_cast(w)),
+                        indice.astype(np.int64, copy=False),
+                        w.astype(weight_dtype, copy=False),
                         dense_shape=[i_npix,o_cell_ids.shape[0]],
                     )
                     
@@ -1762,35 +1764,47 @@ class FoCUS:
             
         if spin==0:
             
+            value_dtype = np.dtype(self.backend.all_type)
+            idx_tmp = tmp.astype(np.int64, copy=False)
+            idx_tmp2 = tmp2.astype(np.int64, copy=False)
+            wr_vals = wr.astype(value_dtype, copy=False)
+            wi_vals = wi.astype(value_dtype, copy=False)
+            ws_vals = ws.astype(value_dtype, copy=False)
             wr = self.backend.bk_SparseTensor(
-                self.backend.bk_constant(tmp),
-                self.backend.bk_constant(self.backend.bk_cast(wr)),
+                idx_tmp,
+                wr_vals,
                 dense_shape=[ncell, self.NORIENT * ncell],
             )
             wi = self.backend.bk_SparseTensor(
-                self.backend.bk_constant(tmp),
-                self.backend.bk_constant(self.backend.bk_cast(wi)),
+                idx_tmp,
+                wi_vals,
                 dense_shape=[ncell, self.NORIENT * ncell],
             )
             ws = self.backend.bk_SparseTensor(
-                self.backend.bk_constant(tmp2),
-                self.backend.bk_constant(self.backend.bk_cast(ws)),
+                idx_tmp2,
+                ws_vals,
                 dense_shape=[ncell, ncell],
             )
         else:
+            value_dtype = np.dtype(self.backend.all_type)
+            idx_tmp = tmp.astype(np.int64, copy=False)
+            idx_tmp2 = tmp2.astype(np.int64, copy=False)
+            wr_vals = wr.astype(value_dtype, copy=False)
+            wi_vals = wi.astype(value_dtype, copy=False)
+            ws_vals = ws.astype(value_dtype, copy=False)
             wr = self.backend.bk_SparseTensor(
-                self.backend.bk_constant(tmp),
-                self.backend.bk_constant(self.backend.bk_cast(wr)),
+                idx_tmp,
+                wr_vals,
                 dense_shape=[2*ncell, 2*self.NORIENT * ncell],
             )
             wi = self.backend.bk_SparseTensor(
-                self.backend.bk_constant(tmp),
-                self.backend.bk_constant(self.backend.bk_cast(wi)),
+                idx_tmp,
+                wi_vals,
                 dense_shape=[2*ncell, 2*self.NORIENT * ncell],
             )
             ws = self.backend.bk_SparseTensor(
-                self.backend.bk_constant(tmp2),
-                self.backend.bk_constant(self.backend.bk_cast(ws)),
+                idx_tmp2,
+                ws_vals,
                 dense_shape=[2*ncell, 2*ncell],
             )
 
