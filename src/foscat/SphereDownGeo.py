@@ -1,13 +1,13 @@
 """
-SphereDownGeo.py - Optimized HEALPix downsampling with KD-tree and caching
+SphereDownGeo.py - Optimized HEALPix downsampling with Parallel Processing and Caching
 
-This is a drop-in replacement for foscat's SphereDownGeo.py with:
-1. KD-tree spatial queries (replaces slow hp.query_disc loop)
-2. Parallel weight computation via joblib
-3. Disk caching for instant reloading
-4. Progress reporting
+OPTIMIZATION STRATEGY:
+- Replaces the serial loop over coarse pixels with a PARALLEL loop using joblib.
+- Uses the EXACT same `hp.query_disc(inclusive=True)` logic as the original to guarantee
+  numerically identical results (unlike KD-tree approximations).
+- Adds disk caching.
 
-Expected speedup: 50-200x (1+ hour -> 1-5 minutes for first run, instant thereafter)
+Expected speedup: Linear with core count (e.g. ~50x on 64 cores).
 """
 
 import os
@@ -20,9 +20,6 @@ import torch
 import torch.nn as nn
 import numpy as np
 import healpy as hp
-
-# Spatial query
-from scipy.spatial import cKDTree
 
 # Parallel processing
 try:
@@ -42,28 +39,9 @@ class SphereDownGeo(nn.Module):
     This module reduces resolution by a factor 2:
         nside_out = nside_in // 2
 
-    Input conventions
-    -----------------
-    - If in_cell_ids is None:
-        x is expected to be full-sphere: [B, C, N_in]
-        output is [B, C, K_out] with K_out = len(cell_ids_out) (or N_out if None).
-    - If in_cell_ids is provided (fine pixels at nside_in, NESTED):
-        x can be either:
-          * compact: [B, C, K_in] where K_in = len(in_cell_ids), aligned with in_cell_ids order
-          * full-sphere: [B, C, N_in] (also supported)
-        output is [B, C, K_out] where cell_ids_out is derived as unique(in_cell_ids // 4),
-        unless you explicitly pass cell_ids_out (then it will be intersected with the derived set).
-
-    Modes
-    -----
-    - mode="smooth": linear downsampling y = M @ x  (M sparse)
-    - mode="maxpool": non-linear max over available children (fast)
-    
-    Optimizations (this version)
-    ----------------------------
-    - KD-tree spatial queries instead of per-pixel hp.query_disc()
-    - Parallel weight computation using joblib
-    - Disk caching to avoid recomputation
+    Optimizations (this version):
+    - Parallel execution of hp.query_disc via joblib (fast + exact).
+    - Disk caching.
     """
 
     def __init__(
@@ -137,7 +115,6 @@ class SphereDownGeo(nn.Module):
         if self.mode == "smooth":
             if radius_deg is None:
                 # default: include roughly the 4 children footprint
-                # (healpy pixel size ~ sqrt(4pi/N), coarse pixel is 4x area)
                 radius_deg = 2.0 * hp.nside2resol(self.nside_out, arcmin=True) / 60.0
             if sigma_deg is None:
                 sigma_deg = max(radius_deg / 2.0, 1e-6)
@@ -152,7 +129,8 @@ class SphereDownGeo(nn.Module):
             if M is None:
                 if self.verbose:
                     print(f"Building downgrade matrix: {self.K_out} coarse pixels, {self.K_in} fine pixels...")
-                M = self._build_down_matrix_fast()
+                # We use the optimized parallel build
+                M = self._build_down_matrix_parallel()
                 self._save_matrix_to_cache(M)
               
             self.M = M.coalesce()
@@ -164,8 +142,6 @@ class SphereDownGeo(nn.Module):
 
         else:
             # Precompute children indices for maxpool
-            # For subset mode, store mapping from each parent to indices in compact vector,
-            # with -1 for missing children.
             children = np.stack(
                 [4 * self.cell_ids_out + i for i in range(4)],
                 axis=1,
@@ -210,8 +186,12 @@ class SphereDownGeo(nn.Module):
             'K_in': self.K_in,
             'has_subset': self.has_in_subset,
         }
+        # Hashing the ID arrays is important to distinguish different patches
         if self.has_in_subset:
             config['in_hash'] = hashlib.md5(self.in_cell_ids.tobytes()).hexdigest()[:16]
+            config['out_hash'] = hashlib.md5(self.cell_ids_out.tobytes()).hexdigest()[:16]
+        else:
+            # If full sphere, cell_ids_out might still be a subset or full
             config['out_hash'] = hashlib.md5(self.cell_ids_out.tobytes()).hexdigest()[:16]
         
         config_str = str(sorted(config.items()))
@@ -305,252 +285,137 @@ class SphereDownGeo(nn.Module):
         q = np.asarray(query_ids, dtype=np.int64)
         idx = np.searchsorted(sorted_ids, q)
         idx = np.clip(idx, 0, sorted_ids.size - 1)
-        ok = (idx >= 0) & (idx < sorted_ids.size) & (sorted_ids[idx] == q)
+        ok = (idx < sorted_ids.size) & (sorted_ids[idx] == q)
         out = np.full(q.shape, -1, dtype=np.int64)
         out[ok] = idx[ok]
         return out
 
     # ---------------- weights and matrix build ----------------
-    def _normalize_weights(self, w: np.ndarray) -> np.ndarray:
-        w = np.asarray(w, dtype=np.float64)
-        if w.size == 0:
-            return w
-        w = np.maximum(w, 0.0)
-
-        if self.weight_norm == "l1":
-            s = w.sum()
-            if s <= 0.0:
-                return np.ones_like(w) / max(w.size, 1)
-            return w / s
-
-        # l2
-        s2 = (w * w).sum()
-        if s2 <= 0.0:
-            return np.ones_like(w) / max(np.sqrt(w.size), 1.0)
-        return w / np.sqrt(s2)
-
-    def _build_down_matrix_fast(self) -> torch.Tensor:
+    
+    def _build_down_matrix_parallel(self) -> torch.Tensor:
         """
-        Build downsampling matrix using KD-tree for fast spatial queries.
+        Build downsampling matrix using Parallelized hp.query_disc calls.
         
-        This is MUCH faster than the original hp.query_disc() loop approach.
+        This uses joblib to distribute the EXACT logic from the original implementation
+        across multiple cores. This ensures numerical equivalence while providing significant speedup.
         """
         t_start = time.time()
         
+        # Prepare arguments for static method
         nside_in = self.nside_in
         nside_out = self.nside_out
+        radius_rad = self.radius_rad
         sigma_rad = self.sigma_rad
-        
         subset_cols = self.has_in_subset
-        in_ids = self.in_cell_ids if subset_cols else np.arange(self.N_in, dtype=np.int64)
-        
-        # Step 1: Get all fine pixel 3D coordinates (VECTORIZED)
-        if self.verbose:
-            print("  Step 1/4: Computing fine pixel coordinates...")
-        t1 = time.time()
-        
-        fine_vecs = np.array(hp.pix2vec(nside_in, in_ids, nest=True)).T  # Shape: (K_in, 3)
-        
-        if self.verbose:
-            print(f"    Done in {time.time() - t1:.2f}s")
-        
-        # Step 2: Get all coarse pixel 3D coordinates (VECTORIZED)
-        if self.verbose:
-            print("  Step 2/4: Computing coarse pixel coordinates...")
-        t2 = time.time()
-        
-        coarse_vecs = np.array(hp.pix2vec(nside_out, self.cell_ids_out, nest=True)).T  # Shape: (K_out, 3)
-        
-        if self.verbose:
-            print(f"    Done in {time.time() - t2:.2f}s")
-        
-        # Step 3: Build KD-tree from fine pixel coordinates
-        if self.verbose:
-            print("  Step 3/4: Building KD-tree...")
-        t3 = time.time()
-        
-        tree = cKDTree(fine_vecs)
-        
-        if self.verbose:
-            print(f"    Done in {time.time() - t3:.2f}s")
-        
-        # Step 4: Query neighbors and compute weights
-        if self.verbose:
-            print("  Step 4/4: Finding neighbors and computing weights...")
-        t4 = time.time()
-        
-        # Convert angular radius to Euclidean distance on unit sphere
-        # For angle θ, the chord length is 2*sin(θ/2)
-        euclidean_radius = 2.0 * np.sin(self.radius_rad / 2.0)
-        
-        # Batch query: find all fine pixels within radius of each coarse pixel
-        neighbor_lists = tree.query_ball_point(coarse_vecs, r=euclidean_radius, workers=self.n_jobs)
-        
-        if self.verbose:
-            print(f"    KD-tree query done in {time.time() - t4:.2f}s")
-        
-        # Compute weights
-        t5 = time.time()
-        
-        if HAS_JOBLIB and self.n_jobs != 1 and self.K_out > 1000:
-            # Parallel weight computation
-            rows, cols, vals = self._compute_weights_parallel(
-                coarse_vecs, fine_vecs, neighbor_lists, sigma_rad, in_ids
-            )
-        else:
-            # Sequential weight computation
-            rows, cols, vals = self._compute_weights_sequential(
-                coarse_vecs, fine_vecs, neighbor_lists, sigma_rad, in_ids
-            )
-        
-        if self.verbose:
-            print(f"    Weight computation done in {time.time() - t5:.2f}s")
-        
-        # Build sparse tensor
-        if len(rows) == 0:
-            indices = torch.zeros((2, 0), dtype=torch.long, device=self.device)
-            vals_t = torch.zeros((0,), dtype=self.dtype, device=self.device)
-            return torch.sparse_coo_tensor(
-                indices, vals_t, size=(self.K_out, self.K_in),
-                device=self.device, dtype=self.dtype
-            ).coalesce()
-
-        rows_t = torch.tensor(rows, dtype=torch.long, device=self.device)
-        cols_t = torch.tensor(cols, dtype=torch.long, device=self.device)
-        vals_t = torch.tensor(vals, dtype=self.dtype, device=self.device)
-
-        indices = torch.stack([rows_t, cols_t], dim=0)
-        M = torch.sparse_coo_tensor(
-            indices, vals_t, size=(self.K_out, self.K_in),
-            device=self.device, dtype=self.dtype
-        ).coalesce()
-        
-        if self.verbose:
-            print(f"  Total matrix build time: {time.time() - t_start:.2f}s")
-        
-        return M
-
-    def _compute_weights_sequential(self, coarse_vecs, fine_vecs, neighbor_lists, sigma_rad, in_ids):
-        """Compute Gaussian weights sequentially."""
-        rows = []
-        cols = []
-        vals = []
-        
-        report_interval = max(1, self.K_out // 10)
-        subset_cols = self.has_in_subset
-        
-        for r, neighbors in enumerate(neighbor_lists):
-            if self.verbose and r % report_interval == 0:
-                print(f"      Processing coarse pixel {r}/{self.K_out} ({100*r/self.K_out:.0f}%)")
-            
-            if len(neighbors) == 0:
-                # Fallback to direct children
-                p_out = self.cell_ids_out[r]
-                children = (4 * int(p_out) + np.arange(4, dtype=np.int64))
-                if subset_cols:
-                    pos = self._positions_in_sorted(in_ids, children)
-                    ok = pos >= 0
-                    if not np.any(ok):
-                        continue
-                    neighbors = pos[ok].tolist()
-                else:
-                    neighbors = children.tolist()
-            
-            neighbors = np.array(neighbors, dtype=np.int64)
-            
-            # Compute angular distances using dot product
-            vec0 = coarse_vecs[r]
-            vecs = fine_vecs[neighbors]
-            dots = np.clip(np.dot(vecs, vec0), -1.0, 1.0)
-            ang = np.arccos(dots)
-            
-            # Gaussian weights (same formula as original)
-            w = np.exp(-2.0 * (ang / sigma_rad) ** 2)
-            
-            # Normalize
-            w = self._normalize_weights(w)
-            
-            # Append to lists
-            rows.extend([r] * len(neighbors))
-            cols.extend(neighbors.tolist())
-            vals.extend(w.tolist())
-        
-        return np.array(rows, dtype=np.int64), np.array(cols, dtype=np.int64), np.array(vals, dtype=np.float64)
-
-    def _compute_weights_parallel(self, coarse_vecs, fine_vecs, neighbor_lists, sigma_rad, in_ids):
-        """Compute Gaussian weights in parallel using joblib."""
-        
-        subset_cols = self.has_in_subset
+        in_ids = self.in_cell_ids
         cell_ids_out = self.cell_ids_out
         weight_norm = self.weight_norm
         
-        def process_chunk(chunk_indices):
+        # Determine number of jobs
+        n_jobs = self.n_jobs if self.n_jobs != 0 else -1
+        if n_jobs < 0:
+            n_jobs = os.cpu_count() or 1
+        
+        # Split work into chunks
+        # Chunk size is a tradeoff: too small = overhead, too large = load imbalance
+        chunk_size = max(64, self.K_out // (n_jobs * 8))
+        chunks = []
+        for i in range(0, self.K_out, chunk_size):
+            end = min(i + chunk_size, self.K_out)
+            chunks.append( (i, cell_ids_out[i:end]) )
+            
+        if self.verbose:
+            print(f"  Parallel build: {len(chunks)} chunks on {n_jobs} workers")
+
+        # Define the worker function (must be static/picklable or local)
+        # We capture context variables.
+        def process_chunk(start_idx, chunk_p_out):
             local_rows = []
             local_cols = []
             local_vals = []
             
-            for r in chunk_indices:
-                neighbors = neighbor_lists[r]
-                
-                if len(neighbors) == 0:
-                    # Fallback to direct children
-                    p_out = cell_ids_out[r]
-                    children = (4 * int(p_out) + np.arange(4, dtype=np.int64))
-                    if subset_cols:
-                        pos = SphereDownGeo._positions_in_sorted(in_ids, children)
-                        ok = pos >= 0
-                        if not np.any(ok):
-                            continue
-                        neighbors = pos[ok].tolist()
-                    else:
-                        neighbors = children.tolist()
-                
-                neighbors = np.array(neighbors, dtype=np.int64)
-                
-                # Compute angular distances
-                vec0 = coarse_vecs[r]
-                vecs = fine_vecs[neighbors]
-                dots = np.clip(np.dot(vecs, vec0), -1.0, 1.0)
-                ang = np.arccos(dots)
-                
-                # Gaussian weights
-                w = np.exp(-2.0 * (ang / sigma_rad) ** 2)
-                
-                # Normalize (inline to avoid method call overhead)
+            # Re-import inside worker to ensure visibility in all contexts
+            import healpy as hp
+            import numpy as np
+
+            # Helper for weight normalization (local implementation to avoid self dependence)
+            def normalize(w):
                 w = np.maximum(w, 0.0)
                 if weight_norm == "l1":
                     s = w.sum()
-                    if s > 0:
-                        w = w / s
-                    else:
-                        w = np.ones_like(w) / max(len(w), 1)
-                else:  # l2
-                    s2 = (w * w).sum()
-                    if s2 > 0:
-                        w = w / np.sqrt(s2)
-                    else:
-                        w = np.ones_like(w) / max(np.sqrt(len(w)), 1.0)
+                    return w / s if s > 0 else np.ones_like(w) / max(w.size, 1)
+                else: # l2
+                    s2 = (w*w).sum()
+                    return w / np.sqrt(s2) if s2 > 0 else np.ones_like(w) / max(np.sqrt(w.size), 1.0)
+
+            # Pre-calculate common things if possible, but hp.pix2ang is very fast
+            for i, p_out in enumerate(chunk_p_out):
+                row_idx = start_idx + i
                 
-                local_rows.extend([r] * len(neighbors))
-                local_cols.extend(neighbors.tolist())
-                local_vals.extend(w.tolist())
+                # 1. Get coarse pixel center
+                theta0, phi0 = hp.pix2ang(nside_out, int(p_out), nest=True)
+                vec0 = hp.ang2vec(theta0, phi0)
+
+                # 2. Query disc (EXACT same as reference)
+                neigh = hp.query_disc(nside_in, vec0, radius_rad, inclusive=True, nest=True)
+                neigh = np.asarray(neigh, dtype=np.int64)
+
+                # 3. Filter subset
+                if subset_cols:
+                    neigh_sorted = np.sort(neigh)
+                    neigh = np.intersect1d(neigh_sorted, in_ids, assume_unique=False)
+
+                # 4. Fallback for empty neighbors
+                if neigh.size == 0:
+                    children = (4 * int(p_out) + np.arange(4, dtype=np.int64))
+                    if subset_cols:
+                        # manual searchsorted since we can't use self._positions... efficiently here
+                        idx = np.searchsorted(in_ids, children)
+                        idx = np.clip(idx, 0, in_ids.size - 1)
+                        ok = (idx < in_ids.size) & (in_ids[idx] == children)
+                        if np.any(ok):
+                            neigh = children[ok]
+                        else:
+                            continue
+                    else:
+                        neigh = children
+
+                # 5. Compute weights
+                theta, phi = hp.pix2ang(nside_in, neigh, nest=True)
+                vec = hp.ang2vec(theta, phi)
+
+                dots = np.clip(np.dot(vec, vec0), -1.0, 1.0)
+                ang = np.arccos(dots)
+                w = np.exp(- 2*(ang / sigma_rad) ** 2)
+                w = normalize(w)
+
+                # 6. Store
+                if subset_cols:
+                    # Map global ID back to compact index
+                    idx = np.searchsorted(in_ids, neigh)
+                    # We know they exist because of the intersection above
+                    for c_compact, val in zip(idx, w):
+                        local_rows.append(row_idx)
+                        local_cols.append(c_compact)
+                        local_vals.append(val)
+                else:
+                    for c_global, val in zip(neigh, w):
+                        local_rows.append(row_idx)
+                        local_cols.append(c_global)
+                        local_vals.append(val)
             
             return local_rows, local_cols, local_vals
-        
-        # Split into chunks
-        n_jobs = self.n_jobs if self.n_jobs > 0 else os.cpu_count()
-        chunk_size = max(100, self.K_out // (n_jobs * 4))
-        chunks = [list(range(i, min(i + chunk_size, self.K_out)))
-                  for i in range(0, self.K_out, chunk_size)]
-        
-        if self.verbose:
-            print(f"      Using {n_jobs} workers, {len(chunks)} chunks")
-        
-        results = Parallel(n_jobs=n_jobs, verbose=0)(
-            delayed(process_chunk)(chunk) for chunk in chunks
-        )
-        
-        # Combine results
+
+        # Execute parallel
+        if HAS_JOBLIB and n_jobs != 1:
+            results = Parallel(n_jobs=n_jobs, verbose=0)(
+                delayed(process_chunk)(idx, p_out_chunk) for idx, p_out_chunk in chunks
+            )
+        else:
+            # Serial fallback
+            results = [process_chunk(idx, p_out_chunk) for idx, p_out_chunk in chunks]
+
+        # Flatten results
         all_rows = []
         all_cols = []
         all_vals = []
@@ -558,8 +423,30 @@ class SphereDownGeo(nn.Module):
             all_rows.extend(r)
             all_cols.extend(c)
             all_vals.extend(v)
+            
+        if self.verbose:
+            print(f"  Matrix build completed in {time.time() - t_start:.2f}s")
+            
+        # Build tensor
+        if len(all_rows) == 0:
+            indices = torch.zeros((2, 0), dtype=torch.long, device=self.device)
+            vals_t = torch.zeros((0,), dtype=self.dtype, device=self.device)
+            return torch.sparse_coo_tensor(
+                indices, vals_t, size=(self.K_out, self.K_in),
+                device=self.device, dtype=self.dtype
+            ).coalesce()
+
+        rows_t = torch.tensor(all_rows, dtype=torch.long, device=self.device)
+        cols_t = torch.tensor(all_cols, dtype=torch.long, device=self.device)
+        vals_t = torch.tensor(all_vals, dtype=self.dtype, device=self.device)
+
+        indices = torch.stack([rows_t, cols_t], dim=0)
+        M = torch.sparse_coo_tensor(
+            indices, vals_t, size=(self.K_out, self.K_in),
+            device=self.device, dtype=self.dtype
+        ).coalesce()
         
-        return np.array(all_rows, dtype=np.int64), np.array(all_cols, dtype=np.int64), np.array(all_vals, dtype=np.float64)
+        return M
 
     # ---------------- forward ----------------
     def forward(self, x: torch.Tensor):
